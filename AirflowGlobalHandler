@@ -1,0 +1,104 @@
+from airflow import DAG, settings
+from airflow.models import SlaMiss
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+from airflow.providers.amazon.aws.operators.sns import SnsPublishOperator
+import logging
+import pendulum
+
+class GlobalErrorHandler:
+    """A class-based global error handler for Airflow."""
+
+    def __init__(self, sns_topic_arn, aws_conn_id='aws_default'):
+        self.sns_topic_arn = sns_topic_arn
+        self.aws_conn_id = aws_conn_id
+
+    def handle_task_failure(self, context):
+        """Handles task failures by logging and sending SNS alerts."""
+        # 1. Detailed Logging
+        logging.error("DAG/Task Failure Details:")
+        logging.error(f"DAG ID: {context['dag'].dag_id}")
+        logging.error(f"Task ID: {context['task'].task_id}")
+        logging.error(f"Execution Date: {context['execution_date']}")
+        logging.error(f"Error: {context['exception']}")
+
+        # 2. SNS Notification (Customize message as needed)
+        sns_message = f"""
+        Airflow Error Alert!
+
+        DAG: {context['dag'].dag_id}
+        Task: {context['task'].task_id}
+        Error: {context['exception']}
+        """
+
+        sns_publish = SnsPublishOperator(
+            task_id='sns_error_notification',
+            target_arn=self.sns_topic_arn,
+            message=sns_message,
+            aws_conn_id=self.aws_conn_id,
+        )
+        sns_publish.execute(context)
+
+
+    def handle_sla_miss(self, dag, task_list, blocking_task_list, slas, blocking_tis):
+        """Handles SLA misses by logging and sending SNS alerts."""
+        # Log SLA miss details
+        for ti in blocking_tis:
+            logging.error(f"SLA Missed for DAG: {dag.dag_id}, Task: {ti.task_id}")
+
+        # Extract relevant information from the SLA Miss object
+        sla_miss = SlaMiss.get_latest_sla_miss(ti=blocking_tis[0])
+
+        # Determine the root cause of the SLA miss
+        if sla_miss.task_id in task_list:  # Long running task
+            message = f"Long-running task detected: {sla_miss.task_id}"
+        else:  # Downstream dependency
+            message = f"SLA missed due to a downstream dependency for task: {sla_miss.task_id}"
+
+        # Construct a message to publish to SNS
+        sns_message = f"""
+        Airflow SLA Alert!
+
+        DAG: {dag.dag_id}
+        Task: {sla_miss.task_id}
+        Timestamp: {sla_miss.timestamp}
+        Root Cause: {message}
+        """
+        sns_publish = SnsPublishOperator(
+            task_id='sns_sla_notification',
+            target_arn=self.sns_topic_arn,
+            message=sns_message,
+            aws_conn_id=self.aws_conn_id,
+        )
+        sns_publish.execute(context)
+
+# Usage Example
+sns_topic_arn = 'YOUR_SNS_TOPIC_ARN'
+
+global_error_handler = GlobalErrorHandler(sns_topic_arn)
+
+# Sample DAG 
+with DAG(
+    dag_id='class_based_error_handling_example',
+    default_args={
+        'on_failure_callback': global_error_handler.handle_task_failure,  
+        'sla_miss_callback': global_error_handler.handle_sla_miss,
+        'retries': 0,
+        'sla': pendulum.duration(minutes=10),  # Define SLA for the DAG
+    },
+    schedule_interval=None,
+    start_date=days_ago(1),
+) as dag:
+    task1 = PythonOperator(
+        task_id='quick_task',
+        python_callable=lambda: print("Task 1 Success"),
+        sla=pendulum.duration(minutes=5),  # Task-level SLA
+    )
+
+    # Task 2 is intentionally slow (can be replaced with your long-running task)
+    task2 = PythonOperator(
+        task_id='slow_task',
+        python_callable=lambda: time.sleep(60 * 12),  # Sleep for 12 minutes (to exceed SLA)
+    )
+
+    task1 >> task2 
